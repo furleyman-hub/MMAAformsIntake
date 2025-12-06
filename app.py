@@ -13,6 +13,7 @@ try:
 except ImportError:
     fitz = None
 
+
 # -----------------------------
 # CONFIG
 # -----------------------------
@@ -24,11 +25,11 @@ ZAPIER_WEBHOOK_URL = st.secrets.get(
 )
 
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
-OPENAI_MODEL = "gpt-4o"  # Vision-capable model
+OPENAI_MODEL = "gpt-4o"   # Vision-capable model
 
 
 # -----------------------------
-# FILE → IMAGE BYTES
+# HELPERS: FILE -> IMAGE BYTES
 # -----------------------------
 
 def ensure_pdf_ready():
@@ -69,7 +70,7 @@ def file_to_image_bytes(filename: str, data: bytes) -> bytes:
 
 
 # -----------------------------
-# OPENAI VISION OCR + PARSE
+# OPENAI VISION → FINAL EFC PAYLOAD
 # -----------------------------
 
 def ensure_openai_ready():
@@ -79,29 +80,53 @@ def ensure_openai_ready():
         )
 
 
-def extract_fields_from_image(image_bytes: bytes) -> Dict[str, str]:
+def extract_efc_payload_from_image(image_bytes: bytes) -> Dict[str, str]:
     """
-    Use OpenAI Vision to read the form and return structured fields as JSON.
-    Expected keys:
-      participant_name, parent_name, address, city, state, zip, email, phone
+    Use OpenAI Vision to read the form and return the FINAL EFC payload directly.
+
+    Expected keys (all required):
+
+      student_title        -> always "Miss"
+      student_first_name   -> participant first name
+      student_last_name    -> participant last name
+      contact_title        -> always "Mrs"
+      contact_first_name   -> parent first name
+      contact_last_name    -> parent last name
+      email                -> parent email
+      phone                -> parent phone
+      location             -> always "Marti Martial Arts Academy - NY - Marti Martial Arts - NY"
     """
     ensure_openai_ready()
 
     b64 = base64.b64encode(image_bytes).decode("utf-8")
 
     prompt = (
-        "You are reading a Girl Scout or seminar signup form. "
-        "Extract the following fields from the form and return ONLY a JSON object:\n"
-        "  - participant_name: the participant's full name\n"
-        "  - parent_name: the parent/guardian's full name\n"
-        "  - address: street address\n"
-        "  - city\n"
-        "  - state: 2-letter code\n"
-        "  - zip: 5-digit or 9-digit ZIP\n"
-        "  - email: parent/guardian email\n"
-        "  - phone: parent/guardian mobile or main phone\n\n"
-        "If a field is missing or illegible, use an empty string for that field.\n"
-        "Respond with JSON ONLY, no explanation, no markdown."
+        "You are reading a printed signup form for a Girl Scout or seminar event at "
+        "Marti Martial Arts Academy.\n\n"
+        "From the form, identify:\n"
+        "- The PARTICIPANT (student/child) full name\n"
+        "- The PARENT or GUARDIAN full name\n"
+        "- The parent/guardian email address\n"
+        "- The parent/guardian mobile phone number\n\n"
+        "Then build exactly this JSON object (no extra keys, no comments, no markdown):\n\n"
+        "{\n"
+        '  \"student_title\": \"Miss\",\n'
+        '  \"student_first_name\": \"<participant first name>\",\n'
+        '  \"student_last_name\": \"<participant last name>\",\n'
+        '  \"contact_title\": \"Mrs\",\n'
+        '  \"contact_first_name\": \"<parent first name>\",\n'
+        '  \"contact_last_name\": \"<parent last name>\",\n'
+        '  \"email\": \"<parent email>\",\n'
+        '  \"phone\": \"<parent mobile phone>\",\n'
+        '  \"location\": \"Marti Martial Arts Academy - NY - Marti Martial Arts - NY\"\n'
+        "}\n\n"
+        "Rules:\n"
+        "- Always use the literal string \"Miss\" for student_title.\n"
+        "- Always use the literal string \"Mrs\" for contact_title.\n"
+        "- Split names into first and last at the first space; if only one name is present, "
+        "use it as the first name and leave the last name empty.\n"
+        "- If any value is missing or unreadable, use an empty string for that field.\n"
+        "- Respond with JSON ONLY, no additional text or formatting."
     )
 
     headers = {
@@ -114,7 +139,7 @@ def extract_fields_from_image(image_bytes: bytes) -> Dict[str, str]:
         "messages": [
             {
                 "role": "system",
-                "content": "You extract structured data from images of forms.",
+                "content": "You extract structured EFC lead data from images of forms.",
             },
             {
                 "role": "user",
@@ -132,7 +157,7 @@ def extract_fields_from_image(image_bytes: bytes) -> Dict[str, str]:
         "temperature": 0,
     }
 
-    resp = requests.post(OPENAI_API_URL, headers=headers, data=json.dumps(body), timeout=30)
+    resp = requests.post(OPENAI_API_URL, headers=headers, data=json.dumps(body), timeout=45)
     if resp.status_code >= 300:
         raise RuntimeError(f"OpenAI API error {resp.status_code}: {resp.text[:300]}")
 
@@ -143,7 +168,6 @@ def extract_fields_from_image(image_bytes: bytes) -> Dict[str, str]:
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError:
-        # Try to salvage JSON if the model wrapped it in text
         try:
             start = content.index("{")
             end = content.rindex("}") + 1
@@ -151,75 +175,32 @@ def extract_fields_from_image(image_bytes: bytes) -> Dict[str, str]:
         except Exception:
             raise RuntimeError(f"Could not parse JSON from OpenAI response: {content}")
 
-    # Normalize keys and ensure all fields exist
-    normalized: Dict[str, str] = {}
-    for key in [
-        "participant_name",
-        "parent_name",
-        "address",
-        "city",
-        "state",
-        "zip",
+    # Ensure all required keys exist and are strings
+    required_keys = [
+        "student_title",
+        "student_first_name",
+        "student_last_name",
+        "contact_title",
+        "contact_first_name",
+        "contact_last_name",
         "email",
         "phone",
-    ]:
+        "location",
+    ]
+
+    normalized: Dict[str, str] = {}
+    for key in required_keys:
         value = parsed.get(key, "")
         if value is None:
             value = ""
         normalized[key] = str(value).strip()
 
+    # Enforce your hard-coded values regardless of model behavior
+    normalized["student_title"] = "Miss"
+    normalized["contact_title"] = "Mrs"
+    normalized["location"] = "Marti Martial Arts Academy - NY - Marti Martial Arts - NY"
+
     return normalized
-
-
-# -----------------------------
-# BUILD EFC PAYLOAD
-# -----------------------------
-
-def split_name(full: str) -> Tuple[str, str]:
-    parts = full.split()
-    if len(parts) == 0:
-        return "", ""
-    if len(parts) == 1:
-        return parts[0], ""
-    return parts[0], " ".join(parts[1:])
-
-
-def build_lead_payload(parsed: Dict[str, str]) -> Dict[str, str]:
-    """
-    Final mapping required by EFC Aquilla.
-    Mapping (per your spec):
-      Title → "Miss"
-      First Name → participant first name
-      Last Name → participant last name
-      Contact Title → "Mrs"
-      Contact First Name → parent first name
-      Contact Last Name → parent last name
-      Email address → parent email
-      Mobile phone → parent phone
-      Location → hard-coded dojo location
-    """
-
-    # Student (participant)
-    student_full = parsed.get("participant_name", "")
-    student_first, student_last = split_name(student_full)
-
-    # Parent (contact)
-    parent_full = parsed.get("parent_name", "")
-    contact_first, contact_last = split_name(parent_full)
-
-    payload = {
-        "title": "Miss",
-        "first_name": student_first,
-        "last_name": student_last,
-        "contact_title": "Mrs",
-        "contact_first_name": contact_first,
-        "contact_last_name": contact_last,
-        "email_address": parsed.get("email", ""),
-        "mobile_phone": parsed.get("phone", ""),
-        "location": "Marti Martial Arts Academy - NY - Marti Martial Arts - NY",
-    }
-
-    return {k: v.strip() if isinstance(v, str) else v for k, v in payload.items()}
 
 
 # -----------------------------
@@ -254,8 +235,8 @@ def main():
     st.title("Seminar Form OCR → EFC Aquilla Lead Generator")
     st.write(
         "Upload one or more scanned PDFs or images of completed forms. "
-        "Each file will be sent to OpenAI Vision, parsed into contact fields, "
-        "and submitted as a lead via Zapier."
+        "Each file will be sent to OpenAI Vision, converted into an EFC lead payload, "
+        "and submitted to Zapier."
     )
 
     if not OPENAI_API_KEY:
@@ -283,17 +264,13 @@ def main():
                 preview_img = Image.open(io.BytesIO(image_bytes))
                 st.image(preview_img, caption="Preview (first page)", use_column_width=True)
 
-                with st.spinner("Calling OpenAI Vision to extract fields..."):
-                    parsed_fields = extract_fields_from_image(image_bytes)
+                with st.spinner("Calling OpenAI Vision to build EFC payload..."):
+                    efc_payload = extract_efc_payload_from_image(image_bytes)
 
-                st.subheader("Extracted fields from form")
-                st.json(parsed_fields)
+                st.subheader("EFC payload to Zapier")
+                st.json(efc_payload)
 
-                payload = build_lead_payload(parsed_fields)
-                st.subheader("EFC payload sent to Zapier")
-                st.json(payload)
-
-                success, msg = send_to_zapier(payload)
+                success, msg = send_to_zapier(efc_payload)
                 if success:
                     st.success(f"Lead sent successfully: {msg}")
                 else:
