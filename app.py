@@ -13,9 +13,9 @@ except ImportError:
     pytesseract = None
 
 try:
-    from pdf2image import convert_from_bytes
+    import fitz  # PyMuPDF
 except ImportError:
-    convert_from_bytes = None
+    fitz = None
 
 
 # -----------------------------
@@ -39,19 +39,34 @@ def ensure_ocr_ready():
         )
 
 
+def ensure_pdf_ready():
+    if fitz is None:
+        raise RuntimeError(
+            "PyMuPDF (pymupdf) is not installed. Install with 'pip install pymupdf'."
+        )
+
+
 def bytes_to_images(filename: str, data: bytes) -> List[Image.Image]:
+    """
+    Convert raw bytes (PDF or image) to a list of PIL Images.
+    Uses PyMuPDF for PDFs, Pillow for images.
+    """
     filename = filename.lower()
 
-    # PDF → convert pages to images
+    # PDF → use PyMuPDF
     if filename.endswith(".pdf"):
-        if convert_from_bytes is None:
-            raise RuntimeError(
-                "pdf2image is not installed. Run 'pip install pdf2image' and install poppler."
-            )
-        pages = convert_from_bytes(data)
-        return [p.convert("RGB") for p in pages]
+        ensure_pdf_ready()
+        images: List[Image.Image] = []
+        doc = fitz.open(stream=data, filetype="pdf")
+        for page in doc:
+            pix = page.get_pixmap()
+            # Convert pixmap to Pillow Image
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            images.append(img)
+        doc.close()
+        return images
 
-    # Image file
+    # Image file → Pillow
     img = Image.open(io.BytesIO(data))
     if img.mode != "RGB":
         img = img.convert("RGB")
@@ -95,7 +110,7 @@ def parse_form_fields(text: str) -> Dict[str, str]:
         "email": r"Parent\/?Guardian\s*Email[:\-]?\s*(.+)",
     }
 
-    parsed = {}
+    parsed: Dict[str, str] = {}
     for key, pattern in FIELD_PATTERNS.items():
         parsed[key] = extract_field(text, pattern)
 
