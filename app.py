@@ -1,6 +1,7 @@
+import base64
 import io
+import json
 import os
-import re
 from typing import Dict, Tuple, List
 
 import requests
@@ -8,36 +9,27 @@ import streamlit as st
 from PIL import Image
 
 try:
-    import pytesseract
-except ImportError:
-    pytesseract = None
-
-try:
     import fitz  # PyMuPDF
 except ImportError:
     fitz = None
 
+# -----------------------------
+# CONFIG
+# -----------------------------
 
-# -----------------------------
-# CONFIG (Zapier URL stored in secrets)
-# -----------------------------
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 ZAPIER_WEBHOOK_URL = st.secrets.get(
     "ZAPIER_WEBHOOK_URL",
     os.getenv("ZAPIER_WEBHOOK_URL")
 )
 
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_MODEL = "gpt-4o"  # Vision-capable model
+
 
 # -----------------------------
-# OCR + FILE HANDLING
+# FILE → IMAGE BYTES
 # -----------------------------
-
-def ensure_ocr_ready():
-    if pytesseract is None:
-        raise RuntimeError(
-            "pytesseract is not installed. Install with 'pip install pytesseract pillow' "
-            "and ensure Tesseract OCR is installed on your system."
-        )
-
 
 def ensure_pdf_ready():
     if fitz is None:
@@ -46,82 +38,144 @@ def ensure_pdf_ready():
         )
 
 
-def bytes_to_images(filename: str, data: bytes) -> List[Image.Image]:
+def file_to_image_bytes(filename: str, data: bytes) -> bytes:
     """
-    Convert raw bytes (PDF or image) to a list of PIL Images.
-    Uses PyMuPDF for PDFs, Pillow for images.
+    Convert uploaded file bytes to a single image (PNG) as bytes.
+    - If PDF: render FIRST PAGE using PyMuPDF.
+    - If image: normalize and export as PNG bytes.
     """
-    filename = filename.lower()
+    name = filename.lower()
 
-    # PDF → use PyMuPDF
-    if filename.endswith(".pdf"):
+    # PDF → use PyMuPDF to get first page as image
+    if name.endswith(".pdf"):
         ensure_pdf_ready()
-        images: List[Image.Image] = []
         doc = fitz.open(stream=data, filetype="pdf")
-        for page in doc:
-            pix = page.get_pixmap()
-            # Convert pixmap to Pillow Image
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            images.append(img)
+        if doc.page_count == 0:
+            doc.close()
+            raise ValueError("PDF has no pages.")
+        page = doc.load_page(0)
+        pix = page.get_pixmap(dpi=200)
+        img_bytes = pix.tobytes("png")
         doc.close()
-        return images
+        return img_bytes
 
-    # Image file → Pillow
+    # Image → use Pillow, normalize to RGB PNG
     img = Image.open(io.BytesIO(data))
     if img.mode != "RGB":
         img = img.convert("RGB")
-    return [img]
-
-
-def ocr_images(images: List[Image.Image]) -> str:
-    ensure_ocr_ready()
-    texts = []
-    for img in images:
-        text = pytesseract.image_to_string(img)
-        texts.append(text)
-    return "\n\n".join(texts)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 # -----------------------------
-# FIELD EXTRACTION
+# OPENAI VISION OCR + PARSE
 # -----------------------------
 
-def extract_field(text: str, pattern: str) -> str:
-    match = re.search(pattern, text, flags=re.IGNORECASE)
-    if not match:
-        return ""
-    value = match.group(1).strip()
-    return value.strip(":-._ \t")
+def ensure_openai_ready():
+    if not OPENAI_API_KEY:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set. Add it to .streamlit/secrets.toml or environment."
+        )
 
 
-def parse_form_fields(text: str) -> Dict[str, str]:
+def extract_fields_from_image(image_bytes: bytes) -> Dict[str, str]:
     """
-    Extract fields matching the sample Girl Scout / Seminar form.
-    Update patterns if OCR output varies.
+    Use OpenAI Vision to read the form and return structured fields as JSON.
+    Expected keys:
+      participant_name, parent_name, address, city, state, zip, email, phone
     """
-    FIELD_PATTERNS = {
-        "participant_name": r"Participant[s']?\s*Name[:\-]?\s*(.+)",
-        "parent_name": r"Parent\/?Guardian\s*Name[:\-]?\s*(.+)",
-        "address": r"Address[:\-]?\s*(.+)",
-        "city": r"City[:\-]?\s*(.+)",
-        "state": r"State[:\-]?\s*([A-Za-z]{2})",
-        "zip": r"Zip\s*Code[:\-]?\s*([0-9]{5}(?:-[0-9]{4})?)",
-        "phone": r"Parent\/?Guardian\s*Phone\s*#?[:\-]?\s*(.+)",
-        "email": r"Parent\/?Guardian\s*Email[:\-]?\s*(.+)",
+    ensure_openai_ready()
+
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    prompt = (
+        "You are reading a Girl Scout or seminar signup form. "
+        "Extract the following fields from the form and return ONLY a JSON object:\n"
+        "  - participant_name: the participant's full name\n"
+        "  - parent_name: the parent/guardian's full name\n"
+        "  - address: street address\n"
+        "  - city\n"
+        "  - state: 2-letter code\n"
+        "  - zip: 5-digit or 9-digit ZIP\n"
+        "  - email: parent/guardian email\n"
+        "  - phone: parent/guardian mobile or main phone\n\n"
+        "If a field is missing or illegible, use an empty string for that field.\n"
+        "Respond with JSON ONLY, no explanation, no markdown."
+    )
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
     }
 
-    parsed: Dict[str, str] = {}
-    for key, pattern in FIELD_PATTERNS.items():
-        parsed[key] = extract_field(text, pattern)
+    body = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You extract structured data from images of forms.",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{b64}"
+                        },
+                    },
+                ],
+            },
+        ],
+        "temperature": 0,
+    }
 
-    return parsed
+    resp = requests.post(OPENAI_API_URL, headers=headers, data=json.dumps(body), timeout=30)
+    if resp.status_code >= 300:
+        raise RuntimeError(f"OpenAI API error {resp.status_code}: {resp.text[:300]}")
+
+    data = resp.json()
+    content = data["choices"][0]["message"]["content"]
+
+    # Parse JSON from the model
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        # Try to salvage JSON if the model wrapped it in text
+        try:
+            start = content.index("{")
+            end = content.rindex("}") + 1
+            parsed = json.loads(content[start:end])
+        except Exception:
+            raise RuntimeError(f"Could not parse JSON from OpenAI response: {content}")
+
+    # Normalize keys and ensure all fields exist
+    normalized: Dict[str, str] = {}
+    for key in [
+        "participant_name",
+        "parent_name",
+        "address",
+        "city",
+        "state",
+        "zip",
+        "email",
+        "phone",
+    ]:
+        value = parsed.get(key, "")
+        if value is None:
+            value = ""
+        normalized[key] = str(value).strip()
+
+    return normalized
 
 
 # -----------------------------
 # BUILD EFC PAYLOAD
 # -----------------------------
 
-def split_name(full: str):
+def split_name(full: str) -> Tuple[str, str]:
     parts = full.split()
     if len(parts) == 0:
         return "", ""
@@ -133,33 +187,39 @@ def split_name(full: str):
 def build_lead_payload(parsed: Dict[str, str]) -> Dict[str, str]:
     """
     Final mapping required by EFC Aquilla.
+    Mapping (per your spec):
+      Title → "Miss"
+      First Name → participant first name
+      Last Name → participant last name
+      Contact Title → "Mrs"
+      Contact First Name → parent first name
+      Contact Last Name → parent last name
+      Email address → parent email
+      Mobile phone → parent phone
+      Location → hard-coded dojo location
     """
 
     # Student (participant)
-    student_full = parsed.get("participant_name", "").strip()
+    student_full = parsed.get("participant_name", "")
     student_first, student_last = split_name(student_full)
 
     # Parent (contact)
-    parent_full = parsed.get("parent_name", "").strip()
+    parent_full = parsed.get("parent_name", "")
     contact_first, contact_last = split_name(parent_full)
 
     payload = {
         "title": "Miss",
         "first_name": student_first,
         "last_name": student_last,
-
         "contact_title": "Mrs",
         "contact_first_name": contact_first,
         "contact_last_name": contact_last,
-
-        "email_address": parsed.get("email", "").strip(),
-        "mobile_phone": parsed.get("phone", "").strip(),
-
-        # Required hard-coded dojo/EFC location
+        "email_address": parsed.get("email", ""),
+        "mobile_phone": parsed.get("phone", ""),
         "location": "Marti Martial Arts Academy - NY - Marti Martial Arts - NY",
     }
 
-    return payload
+    return {k: v.strip() if isinstance(v, str) else v for k, v in payload.items()}
 
 
 # -----------------------------
@@ -177,8 +237,7 @@ def send_to_zapier(payload: Dict[str, str]) -> Tuple[bool, str]:
 
     if 200 <= resp.status_code < 300:
         return True, f"Webhook OK ({resp.status_code})"
-    else:
-        return False, f"Zapier error {resp.status_code}: {resp.text[:300]}"
+    return False, f"Zapier error {resp.status_code}: {resp.text[:300]}"
 
 
 # -----------------------------
@@ -189,19 +248,25 @@ def main():
     st.set_page_config(
         page_title="Seminar Form OCR → EFC Leads",
         page_icon="📝",
-        layout="centered"
+        layout="centered",
     )
 
     st.title("Seminar Form OCR → EFC Aquilla Lead Generator")
     st.write(
         "Upload one or more scanned PDFs or images of completed forms. "
-        "Each file will be OCR’d, parsed, and submitted as a lead."
+        "Each file will be sent to OpenAI Vision, parsed into contact fields, "
+        "and submitted as a lead via Zapier."
     )
 
+    if not OPENAI_API_KEY:
+        st.warning("OPENAI_API_KEY is not set. The app will not work until you add it to secrets.")
+    if not ZAPIER_WEBHOOK_URL:
+        st.warning("ZAPIER_WEBHOOK_URL is not set. Add it to .streamlit/secrets.toml.")
+
     uploaded_files = st.file_uploader(
-        "Upload PDFs or Images",
+        "Upload PDFs or images",
         type=["pdf", "png", "jpg", "jpeg"],
-        accept_multiple_files=True
+        accept_multiple_files=True,
     )
 
     if uploaded_files and st.button("Process & Send Leads"):
@@ -209,30 +274,30 @@ def main():
             st.markdown(f"---\n### File {index}: **{uploaded.name}**")
 
             try:
-                data = uploaded.read()
+                raw_data = uploaded.read()
 
-                images = bytes_to_images(uploaded.name, data)
-                st.image(images[0], caption="Preview (first page)", use_column_width=True)
+                # Convert file → image bytes
+                image_bytes = file_to_image_bytes(uploaded.name, raw_data)
 
-                with st.spinner("Running OCR..."):
-                    text = ocr_images(images)
+                # Show preview
+                preview_img = Image.open(io.BytesIO(image_bytes))
+                st.image(preview_img, caption="Preview (first page)", use_column_width=True)
 
-                st.subheader("OCR Text")
-                st.text_area("Detected Text", text, height=200, key=f"ocr_{index}")
+                with st.spinner("Calling OpenAI Vision to extract fields..."):
+                    parsed_fields = extract_fields_from_image(image_bytes)
 
-                parsed = parse_form_fields(text)
-                st.subheader("Extracted Fields")
-                st.json(parsed)
+                st.subheader("Extracted fields from form")
+                st.json(parsed_fields)
 
-                payload = build_lead_payload(parsed)
-                st.subheader("Payload Sent to EFC")
+                payload = build_lead_payload(parsed_fields)
+                st.subheader("EFC payload sent to Zapier")
                 st.json(payload)
 
                 success, msg = send_to_zapier(payload)
                 if success:
-                    st.success(f"Sent to Zapier successfully: {msg}")
+                    st.success(f"Lead sent successfully: {msg}")
                 else:
-                    st.error(f"Failed to send: {msg}")
+                    st.error(f"Failed to send lead: {msg}")
 
             except Exception as e:
                 st.error(f"Error processing {uploaded.name}: {e}")
