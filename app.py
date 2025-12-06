@@ -2,7 +2,7 @@ import base64
 import io
 import json
 import os
-from typing import Dict, Tuple, List
+from typing import Dict, List, Tuple
 
 import requests
 import streamlit as st
@@ -29,7 +29,7 @@ OPENAI_MODEL = "gpt-4o"   # Vision-capable model
 
 
 # -----------------------------
-# HELPERS: FILE -> IMAGE BYTES
+# HELPERS: FILE -> PAGE IMAGE BYTES
 # -----------------------------
 
 def ensure_pdf_ready():
@@ -39,34 +39,39 @@ def ensure_pdf_ready():
         )
 
 
-def file_to_image_bytes(filename: str, data: bytes) -> bytes:
+def file_to_page_images(filename: str, data: bytes) -> List[bytes]:
     """
-    Convert uploaded file bytes to a single image (PNG) as bytes.
-    - If PDF: render FIRST PAGE using PyMuPDF.
-    - If image: normalize and export as PNG bytes.
+    Convert uploaded file bytes to a list of page images (PNG) as bytes.
+
+    - If PDF: return one PNG bytes object per page.
+    - If image: return a single-item list with that image as PNG bytes.
     """
     name = filename.lower()
 
-    # PDF → use PyMuPDF to get first page as image
+    # PDF → use PyMuPDF for all pages
     if name.endswith(".pdf"):
         ensure_pdf_ready()
         doc = fitz.open(stream=data, filetype="pdf")
         if doc.page_count == 0:
             doc.close()
             raise ValueError("PDF has no pages.")
-        page = doc.load_page(0)
-        pix = page.get_pixmap(dpi=200)
-        img_bytes = pix.tobytes("png")
-        doc.close()
-        return img_bytes
 
-    # Image → use Pillow, normalize to RGB PNG
+        page_images: List[bytes] = []
+        for page in doc:
+            pix = page.get_pixmap(dpi=200)
+            img_bytes = pix.tobytes("png")
+            page_images.append(img_bytes)
+
+        doc.close()
+        return page_images
+
+    # Image → treat as single page
     img = Image.open(io.BytesIO(data))
     if img.mode != "RGB":
         img = img.convert("RGB")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
-    return buf.getvalue()
+    return [buf.getvalue()]
 
 
 # -----------------------------
@@ -82,9 +87,9 @@ def ensure_openai_ready():
 
 def extract_efc_payload_from_image(image_bytes: bytes) -> Dict[str, str]:
     """
-    Use OpenAI Vision to read the form and return the FINAL EFC payload directly.
+    Use OpenAI Vision to read a single form page image and return the FINAL EFC payload.
 
-    Expected keys (all required):
+    Expected keys (all required by your existing integration):
 
       student_title        -> always "Miss"
       student_first_name   -> participant first name
@@ -235,7 +240,7 @@ def main():
     st.title("Seminar Form OCR → EFC Aquilla Lead Generator")
     st.write(
         "Upload one or more scanned PDFs or images of completed forms. "
-        "Each file will be sent to OpenAI Vision, converted into an EFC lead payload, "
+        "Each PDF page or image will be sent to OpenAI Vision, converted into an EFC lead payload, "
         "and submitted to Zapier."
     )
 
@@ -251,30 +256,35 @@ def main():
     )
 
     if uploaded_files and st.button("Process & Send Leads"):
-        for index, uploaded in enumerate(uploaded_files, start=1):
-            st.markdown(f"---\n### File {index}: **{uploaded.name}**")
+        for file_index, uploaded in enumerate(uploaded_files, start=1):
+            st.markdown(f"---\n## File {file_index}: **{uploaded.name}**")
 
             try:
                 raw_data = uploaded.read()
 
-                # Convert file → image bytes
-                image_bytes = file_to_image_bytes(uploaded.name, raw_data)
+                # Convert file → list of page images
+                page_images = file_to_page_images(uploaded.name, raw_data)
+                num_pages = len(page_images)
+                st.info(f"{uploaded.name}: detected {num_pages} page(s).")
 
-                # Show preview
-                preview_img = Image.open(io.BytesIO(image_bytes))
-                st.image(preview_img, caption="Preview (first page)", use_column_width=True)
+                for page_index, image_bytes in enumerate(page_images, start=1):
+                    st.markdown(f"### Page {page_index} of {num_pages}")
 
-                with st.spinner("Calling OpenAI Vision to build EFC payload..."):
-                    efc_payload = extract_efc_payload_from_image(image_bytes)
+                    # Show preview
+                    preview_img = Image.open(io.BytesIO(image_bytes))
+                    st.image(preview_img, caption=f"Preview (page {page_index})", use_column_width=True)
 
-                st.subheader("EFC payload to Zapier")
-                st.json(efc_payload)
+                    with st.spinner("Calling OpenAI Vision to build EFC payload..."):
+                        efc_payload = extract_efc_payload_from_image(image_bytes)
 
-                success, msg = send_to_zapier(efc_payload)
-                if success:
-                    st.success(f"Lead sent successfully: {msg}")
-                else:
-                    st.error(f"Failed to send lead: {msg}")
+                    st.subheader("EFC payload to Zapier")
+                    st.json(efc_payload)
+
+                    success, msg = send_to_zapier(efc_payload)
+                    if success:
+                        st.success(f"Lead for page {page_index} sent successfully: {msg}")
+                    else:
+                        st.error(f"Failed to send lead for page {page_index}: {msg}")
 
             except Exception as e:
                 st.error(f"Error processing {uploaded.name}: {e}")
